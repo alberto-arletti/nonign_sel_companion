@@ -1,0 +1,346 @@
+---
+title: "Companion dataset and code for Statistical methods for non-probability samples in electoral polling: a hands-on introduction, R notebook"
+output: html_notebook
+---
+
+# Companion dataset and code for Statistical methods for non-probability samples in electoral polling: a hands-on introduction
+
+Author: Alberto Arletti 1 co-authors: Maria Letizia Tanturri 1, Omar Paccagnella 1\
+1 Department of Statistical Science, University of Padua
+
+Contact: alberto.arletti at phd.unipd.it
+
+```{r}
+# load dataset 
+load('/data/data.Rdata')
+colnames(df)
+```
+
+The dataset is composed of a number of demographic variables (gen: gender, emp: employment, edu: education, zone: geographical area, age: age bracket) and a variable on political affiliation expressed as the vote on the past election: pastvote. nowvote is the variable of interest. All variables are categorical variables.
+
+We load the census and we can see that the cross-tabulated population values are available for the demographic variables only.
+
+```{r}
+# load census 
+load('/data/census.Rdata')
+head(reference$demo_table)
+```
+
+We also see that the marginal population total for the previous election results are also available.
+
+```{r}
+reference$pastvote_marg
+```
+
+```{r}
+# load libraries 
+library(dplyr)
+```
+
+# Raking
+
+```{r}
+# create raking weights 
+sel_col <-  c('gen', 'age', 'emp', 'edu', 'zone')
+targets <- NULL
+for (col in sel_col){
+  # groupby to get marginal for raking 
+  piece <- reference$demo_table %>% group_by_at(col) %>% summarise('value' = sum(value))
+  # make sum to 1
+  piece$value <- piece$value / sum(piece$value)
+  # add to target vector 
+  targets <- c(targets, list(piece$value))
+  # add names to values in target 
+  names(targets[[length(targets)]]) <- unlist(piece[, 1])
+}
+# assign variable names for pastvote as well 
+names(targets) <- sel_col
+targets$pastvote <- reference$pastvote_marg$value
+names(targets$pastvote) <- reference$pastvote_marg$pastvote
+```
+
+```{r}
+# visualize raking marginal targets 
+print(targets[1:3])
+```
+
+```{r}
+# rake and obtain weights 
+raking_weights <- anesrake::anesrake(targets, df, 1:nrow(df), cap = 5, pctlim = 0.01, verbose = FALSE)$weightvec
+# obtain weighted mean 
+weight_sum <- as.data.frame(questionr::wtd.table(df$nowvote, weights = raking_weights))
+weight_sum$Freq <- weight_sum$Freq / sum(weight_sum$Freq)
+# print results
+raking <- weight_sum
+```
+
+```{r}
+# jacknife estimator of variance 
+library(anesrake)
+source("/Users/albertoarletti/projects/Demetra/february_2023/anesrake.R")
+# to append 
+out <- data.frame()
+for (i in 1:nrow(df)){
+  cat("\rProcessing", i, " our of ", nrow(df))  # \r moves the cursor to the beginning of the line
+  flush.console()
+  jack_df <- df[c(1:(i-1), (i+1):nrow(df)), ]
+  # rake and obtain weights 
+  suppressWarnings(
+    raking_weights <- anesrake_cust(targets, jack_df, 1:nrow(jack_df), cap = 5, pctlim = 0.01, verbose = FALSE)$weightvec
+  )
+  # obtain weighted mean 
+  weight_sum <- as.data.frame(questionr::wtd.table(jack_df$nowvote, weights = raking_weights))
+  weight_sum$Freq <- weight_sum$Freq / sum(weight_sum$Freq)
+  # generate to append 
+  tmp <- weight_sum$Freq
+  names(tmp) <- weight_sum$Var1
+  out <- rbind(out, t(as.data.frame(tmp, stringsAsFactors = FALSE)))
+}
+```
+
+```{r}
+# obtain standard error
+raking$se <- ((nrow(df) - 1) / nrow(df)) * sqrt(apply(sweep(out, 2, raking$Freq, "-")^2, 2, sum))
+# print results with jackknife variance estiamte
+raking
+```
+
+# PS-IPW
+
+Propensity-score based Inverse probability weighting requires a representative sample with common covariates. We synthetically generate such sample using the available cross-tabulated population totals. We choose N = 2000 as the sample size.
+
+```{r}
+library(tidyr)
+# generate
+reference$demo_table$n <- round(reference$demo_table$value * 2000, 0)
+# Use uncount() to repeat rows based on 'value' column
+reference$sample <- (reference$demo_table %>% uncount(n))
+```
+
+We then proceed with the estimation of PS-IPW.
+
+```{r}
+# concatenate non-probability sample with reference sample
+concatenated_df <- bind_rows(df[sel_col], reference$sample[sel_col])
+# add weights 
+concatenated_df$weights <- c(rep(1, nrow(df[sel_col])), reference$sample$value)
+# add indicator variable 
+concatenated_df$S <- c(rep(1, nrow(df[sel_col])), rep(0, nrow(reference$sample)))
+# adjust weights for size of non-probability dataset
+concatenated_df$weights <- concatenated_df$weights * ((sum(1 / reference$sample$value) - nrow(df)) / sum(1 / reference$sample$value))
+# estimate model 
+mod_ipw <- glm(S ~ gen + age + edu + emp + zone, data = concatenated_df, weights = weights, family = binomial(link = 'logit')) # add weights 
+# obtain weights (inverse of propensity)
+ipw_w <- 1 / predict(mod_ipw, newdata = df, type = 'response')
+# obtain weighted mean 
+weight_sum <- as.data.frame(questionr::wtd.table(df$nowvote, weights = ipw_w[1:nrow(df)]))
+weight_sum$Freq <- weight_sum$Freq / sum(weight_sum$Freq)
+ipw <- weight_sum
+ipw
+```
+
+We estimate variance using jacknife again. We repliace the whole procedure for each bootstrap sample.
+
+```{r}
+out <- data.frame()
+for (i in 1:nrow(df)){
+  cat("\rProcessing", i, " our of ", nrow(df))  # \r moves the cursor to the beginning of the line
+  flush.console()
+  jack_df <- df[c(1:(i-1), (i+1):nrow(df)), ]
+  m <- nrow(jack_df[sel_col])
+  # concatenate non-probability sample with reference sample
+  concatenated_jack <- bind_rows(jack_df[sel_col], reference$sample[sel_col])
+  # add weights 
+  concatenated_jack$weights <- c(rep(1, m), reference$sample$value)
+  # add indicator variable 
+  concatenated_jack$S <- c(rep(1, m), rep(0, nrow(reference$sample)))
+  # adjust weights for size of non-probability dataset
+  concatenated_jack$weights <- concatenated_jack$weights * ((sum(1 / reference$sample$value) - m) / sum(1 / reference$sample$value))
+  # estimate model 
+  suppressWarnings(
+    mod_ipw <- glm(S ~ gen + age + edu + emp + zone, data = concatenated_jack, weights = weights, family = binomial(link = 'logit')) # add weights 
+  )
+  # obtain weights (inverse of propensity)
+  ipw_w <- 1 / predict(mod_ipw, newdata = jack_df, type = 'response')
+  # obtain weighted mean 
+  weight_sum <- as.data.frame(questionr::wtd.table(jack_df$nowvote, weights = ipw_w[1:m]))
+  weight_sum$Freq <- weight_sum$Freq / sum(weight_sum$Freq)
+  # generate to append 
+  tmp <- weight_sum$Freq
+  names(tmp) <- weight_sum$Var1
+  out <- rbind(out, t(as.data.frame(tmp, stringsAsFactors = FALSE)))
+}
+```
+
+```{r}
+# add standard error
+ipw$se <- ((nrow(df) - 1) / nrow(df)) * sqrt(apply(sweep(out, 2, ipw$Freq, "-")^2, 2, sum))
+ipw
+```
+
+# post-stratification
+
+In this case, post-strafication is carried out with a multinomial model, without random effects. The model is estimated with maximum likelihood, for simplicity.
+
+```{r}
+# multinomial model 
+mod_mult <- nnet::multinom(as.factor(nowvote) ~ age + gen + emp + edu + zone, data = df, trace = FALSE) 
+post_strat <- predict(mod_mult, newdata = reference$demo_table, type = "probs")
+poststrat <- apply(post_strat * reference$demo_table$value / sum(reference$demo_table$value), 2, sum)
+poststrat <- as.data.frame(poststrat)
+```
+
+Variance is obtained with boostrap with post-stratification for each sample.
+
+```{r}
+out <- data.frame()
+# bootstrap variance estimate
+B <- 100
+for (b in 1:B){
+  cat("\rProcessing", b, " our of ", B)  # \r moves the cursor to the beginning of the line
+  flush.console()
+  boot_index <- sample(nrow(df), nrow(df), replace = TRUE)
+  boot_df <- df[boot_index, ]
+  suppressMessages(mod_mult <- nnet::multinom(as.factor(nowvote) ~ age + gen + emp + edu + zone, data = boot_df, trace = FALSE))
+  post_strat <- predict(mod_mult, newdata = reference$demo_table, type = "probs")
+  tmp <- apply(post_strat * reference$demo_table$value / sum(reference$demo_table$value), 2, sum)
+  out <- rbind(out, t(as.data.frame(tmp, stringsAsFactors = FALSE)))
+}
+```
+
+```{r}
+# add standard error 
+poststrat$se <- apply(out, 2, sd)
+poststrat
+```
+
+# MRP
+
+source <https://bookdown.org/jl5522/MRP-case-studies/introduction-to-mister-p.html#second-stage> Multilevel Regression and Post-Stratification is estimated for a single party using a logistic binomial link function. The variance is obtained through Bayesian estimation.
+
+```{r}
+# bayesian method 
+library(rstanarm)
+# for one party since multinomial estimation is not available in rstanarm
+MRP <- rstanarm::stan_glmer(df$nowvote == 'left-wing' ~ (1|age) + (1|gen) + (1|emp) + (1|edu) + (1|zone), data = df, family = binomial(link = 'logit'))
+epred_mat <- posterior_epred(MRP, newdata = reference$demo_table, draws = 100)
+mrp_estimates_vector <- epred_mat %*% reference$demo_table$value / sum(reference$demo_table$value)
+mrp_estimate <- c(mean = mean(mrp_estimates_vector), sd = sd(mrp_estimates_vector))
+cat("MRP estimate mean, sd: ", round(mrp_estimate, 3))
+```
+
+# embedded post-stratification
+
+First, we use a contrained binomial model to estimate the census values for the missing pastvote variable using synthjoint.
+
+```{r}
+# N voters in the reference population 
+N <- 45210950
+# create count for each cell
+poptable <- reference$demo_table
+poptable$count <- as.integer( poptable$value * N)
+poptable$value <- NULL
+
+# get population totals for missing variable 
+pastvote_dist <- reference$pastvote_marg
+pastvote_dist$count <- as.integer(pastvote_dist$value * N)
+pastvote_dist$value <- NULL
+
+cols <- c('gen', 'age', 'emp', 'edu', 'zone', 'pastvote')
+
+pastvote_dist$pastvote <- factor(pastvote_dist$pastvote, levels = c('right-wing', 'left-wing', 'populist', 'others'))
+df$pastvote <- factor(df$pastvote, levels = c('right-wing', 'left-wing', 'populist', 'others'))
+# estimate to expnad census 
+fin_synth <- synthjoint::synth_bmlogit(pastvote ~ age + gen + edu + emp, 
+             microdata = df,
+             poptable = poptable, 
+             fix_to = pastvote_dist,
+             area_var = 'zone')
+```
+
+Then, we used the census with the new variable added to make a stronger model and a more fine-grained post-stratification
+
+```{r}
+# multinomial model 
+mod_mult <- nnet::multinom(as.factor(nowvote) ~ age + gen + emp + edu + zone + pastvote, data = df, trace = FALSE) 
+post_strat <- predict(mod_mult, newdata = fin_synth, type = "probs")
+poststrat <- apply(post_strat * fin_synth$count / sum(fin_synth$count), 2, sum)
+epoststrat <- as.data.frame(poststrat)
+epoststrat
+```
+
+We provide a bootstrap estimation of variance, repeating the whole procecedure for each sample.
+
+```{r}
+out <- data.frame()
+# bootstrap variance estimate
+B <- 10
+for (b in 1:B){
+  cat("\rProcessing", b, " our of ", B)  # \r moves the cursor to the beginning of the line
+  flush.console()
+  boot_index <- sample(nrow(df), nrow(df), replace = TRUE)
+  boot_df <- df[boot_index, ]
+  suppressMessages(fin_synth_boot <- synthjoint::synth_bmlogit(pastvote ~ age + gen + edu + emp, 
+             microdata = boot_df,
+             poptable = poptable, 
+             fix_to = pastvote_dist,
+             area_var = 'zone'))
+  # multinomial model 
+  mod_mult_boot <- nnet::multinom(as.factor(nowvote) ~ age + gen + emp + edu + zone + pastvote, data = boot_df, trace = FALSE) 
+  post_strat <- predict(mod_mult_boot, newdata = fin_synth_boot, type = "probs")
+  tmp <- apply(post_strat * fin_synth_boot$count / sum(fin_synth_boot$count), 2, sum)
+  out <- rbind(out, t(as.data.frame(tmp, stringsAsFactors = FALSE)))
+}
+```
+
+```{r}
+# add standard error 
+epoststrat$se <- apply(out, 2, sd)
+epoststrat
+```
+
+# doubly robust post-stratification
+
+We use the code provided in the nonprobsvy package to obtain estimation.
+
+```{r}
+# load libraries 
+library(survey)
+library(nonprobsvy)
+# install.packages("nonprobsvy")
+# source: 
+citation("nonprobsvy")
+```
+
+```{r}
+sel_col <-  c('gen', 'age', 'emp', 'edu', 'zone')
+# pass data to binomial dummy format
+df_dummy <- fastDummies::dummy_cols(df[sel_col], remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+# same for census
+census_dummy <- fastDummies::dummy_cols(reference$demo_table, select_columns = sel_col, remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+freq_dummy <- apply(census_dummy, 2, function(x) sum(x * census_dummy$value))
+# N of voters in the reference population 
+N <- 45210950
+pop_totals <- as.integer(freq_dummy * N)
+names(pop_totals) <- c('Y', paste0('X', seq(1, length(names(freq_dummy))-1)))
+# set pop totals variable for synthjoin 
+pop_totals['`(Intercept)`'] <- N
+colnames(df_dummy) <- paste0('X', seq(1, length(colnames(df_dummy))))
+df_dummy$Y <- as.integer(df$nowvote == 'left-wing')
+mod_col <- paste0('X', seq(1, length(colnames(df_dummy))-1))
+```
+
+```{r}
+# Estimate DRP
+dr_logit_poptotals <- nonprob(
+  data = df_dummy,
+  selection = as.formula(paste0('~ ', paste(mod_col, collapse = ' + '))), 
+  outcome = as.formula(paste0('Y ~ ', paste(mod_col, collapse = ' + '))), 
+  pop_totals = pop_totals[c(length(pop_totals), 2:(length(pop_totals)-1))],
+  method_selection = "logit",
+  # svydesign = sample_prob, # for reference sample case 
+  # control_selection = controlSel(est_method_sel = "gee", h = 1)
+)
+# obtain point estimate and variance 
+cbind(dr_logit_poptotals$output,dr_logit_poptotals$confidence_interval)
+```
